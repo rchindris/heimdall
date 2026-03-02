@@ -3,8 +3,10 @@
 from pathlib import Path
 
 import frontmatter
+import pytest
 
-from heimdall.models import RecipeMetadata, RecipeSpec
+from heimdall.models import RecipeMetadata
+from heimdall.recipe_parser import ensure_recipe_supported, load_recipe_spec, summarize_sections
 
 
 SAMPLE_RECIPE = """\
@@ -43,34 +45,23 @@ class TestRecipeParsing:
         assert "test" in metadata.tags
         assert metadata.os_families == ["debian"]
 
-    def test_parse_to_recipe_spec(self):
-        post = frontmatter.loads(SAMPLE_RECIPE)
-        metadata = RecipeMetadata(**post.metadata)
+    def test_load_recipe_spec(self, tmp_path):
+        recipe_path = tmp_path / "recipe.md"
+        recipe_path.write_text(SAMPLE_RECIPE)
 
-        # Split content into sections by h2 headers
-        content = post.content
-        sections = []
-        current = []
-        for line in content.split("\n"):
-            if line.startswith("## "):
-                if current:
-                    sections.append("\n".join(current))
-                current = [line]
-            else:
-                current.append(line)
-        if current:
-            sections.append("\n".join(current))
-
-        spec = RecipeSpec(
-            metadata=metadata,
-            raw_content=content,
-            sections=sections,
-        )
+        spec = load_recipe_spec(recipe_path)
         assert spec.metadata.name == "Test Recipe"
-        # sections[0] is the H1 preamble, H2 sections follow
         assert len(spec.sections) >= 3
         assert "nginx" in spec.sections[1]
         assert "firewall" in spec.sections[2]
+
+    def test_summarize_sections(self, tmp_path):
+        recipe_path = tmp_path / "recipe.md"
+        recipe_path.write_text(SAMPLE_RECIPE)
+        spec = load_recipe_spec(recipe_path)
+        summary = summarize_sections(spec)
+        assert "1." in summary
+        assert "Section One" in summary
 
     def test_parse_real_recipe(self):
         import pytest
@@ -84,6 +75,16 @@ class TestRecipeParsing:
         assert metadata.name == "Home Server"
         assert "debian" in metadata.os_families
         assert len(post.content) > 0
+
+    def test_ensure_recipe_supported_respects_os_list(self, tmp_path, monkeypatch):
+        recipe_path = tmp_path / "recipe.md"
+        recipe_path.write_text(SAMPLE_RECIPE)
+        spec = load_recipe_spec(recipe_path)
+
+        # Force detect_os_family to return something unsupported
+        monkeypatch.setattr("heimdall.recipe_parser.detect_os_family", lambda: "redhat")
+        with pytest.raises(ValueError):
+            ensure_recipe_supported(spec)
 
     def test_empty_frontmatter(self):
         raw = "# Just a title\n\nSome content."

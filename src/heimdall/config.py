@@ -20,6 +20,15 @@ class AdminConfig(BaseModel):
     permission_mode: str = "default"
     max_budget_usd: float = 1.0
     daemon_interval_minutes: int = 60
+    llm_provider: str = "anthropic"
+    llm_api_key_env: str | None = None
+    llm_model_overrides: dict[str, str] = Field(default_factory=dict)
+    openrouter_model: str = "openrouter/openai/gpt-4o-mini"
+    openrouter_api_key_env: str = "OPENROUTER_API_KEY"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_referer: str | None = None
+    openrouter_title: str | None = "Heimdall"
+    openrouter_temperature: float = 0.2
     audit_log_path: Path = Field(
         default_factory=lambda: Path.home()
         / ".local"

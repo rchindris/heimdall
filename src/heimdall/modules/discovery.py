@@ -9,8 +9,8 @@ and produce a comprehensive inventory of its current state.
 Gather the following information:
 - **OS**: hostname, OS name, version, family (debian/redhat/arch/macos), kernel, architecture
 - **Hardware**: CPU model, total memory (GB), total disk (GB)
-- **Packages**: list all installed packages with versions
-- **Services**: list all running/enabled services with their status
+- **Packages**: list up to 200 installed packages with versions and provide a total count
+- **Services**: list running/enabled services with their status
 - **Network**: all interfaces with IPs, all listening ports with processes
 - **Users**: all user accounts with uid, gid, home, shell, groups
 
@@ -33,6 +33,7 @@ Output your findings as a JSON object matching this schema:
 }
 
 Use the available tools to inspect the system. Be thorough but efficient.
+If more than 200 packages exist, summarize the remainder instead of listing them all.
 Write the final JSON to profiles/current.json when complete.
 """
 

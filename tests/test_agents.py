@@ -60,9 +60,9 @@ class TestGuardAgent:
     def test_has_system_prompt(self):
         assert len(GUARD_SYSTEM_PROMPT) > 100
 
-    def test_read_only_bias(self):
-        """Guard agent should not have Write or Edit tools."""
-        assert "Write" not in GUARD_TOOLS
+    def test_has_write_tool(self):
+        """Guard agent needs Write access for drift reports."""
+        assert "Write" in GUARD_TOOLS
         assert "Edit" not in GUARD_TOOLS
 
     def test_no_task_tool(self):

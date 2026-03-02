@@ -1,0 +1,27 @@
+# Sample Heimdall configuration
+# Copy this to config.yaml and set your API key
+
+# === LLM Provider Configuration ===
+# Option 1: OpenRouter (cheapest, recommended)
+llm_provider: openrouter
+openrouter_model: openrouter/openai/gpt-4o-mini  # or any OpenRouter model with tool support
+openrouter_api_key_env: OPENROUTER_API_KEY
+openrouter_temperature: 0.2
+
+# Option 2: Anthropic (original, more expensive)
+# llm_provider: anthropic
+# model: sonnet
+# Set ANTHROPIC_API_KEY environment variable
+
+# === General Configuration ===
+log_level: INFO
+max_budget_usd: 5.0
+recipes_dir: recipes
+profiles_dir: profiles
+daemon_interval_minutes: 60
+
+# === Optional: Model overrides per operation ===
+# llm_model_overrides:
+#   init: openrouter/meta-llama/llama-3.1-8b-instruct
+#   apply: openrouter/openai/gpt-4o-mini
+#   guard: openrouter/meta-llama/llama-3.1-8b-instruct

@@ -38,6 +38,8 @@ Deny everything else.
 
 The recipe applier reads these sections, compares them against the current machine profile, plans the steps, and executes them.
 
+Heimdall parses each recipe into a structured specification at runtime (metadata + numbered sections) and validates `os_families` against the current host. When you run `heimdall apply --check`, the orchestrator enforces a read-only toolset so the agent can plan safely without executing any mutations.
+
 ## Installation
 
 Requires Python 3.12+ and an Anthropic API key.
@@ -81,7 +83,14 @@ daemon_interval_minutes: 60
 log_level: INFO
 recipes_dir: recipes
 profiles_dir: profiles
+llm_provider: anthropic     # or openrouter
+llm_model_overrides:        # optional per-operation overrides
+  apply: sonnet
+openrouter_model: openrouter/openai/gpt-4o-mini
+openrouter_api_key_env: OPENROUTER_API_KEY
 ```
+
+When `llm_provider` is set to `openrouter`, Heimdall uses the OpenRouter chat completions API with native tool-calling. Set the `OPENROUTER_API_KEY` environment variable (or your custom `llm_api_key_env`) before running commands. You can override models per-operation via `llm_model_overrides` (keys: `init`, `apply`, `scan`, `guard`, `orchestrator`, `openrouter`, `discovery`, `recipes`, `guard`).
 
 ## Security model
 

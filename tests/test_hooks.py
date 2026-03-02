@@ -2,7 +2,13 @@
 
 import pytest
 
-from heimdall.hooks import bash_allowlist_hook, mcp_input_validation_hook, set_config
+from heimdall.hooks import (
+    bash_allowlist_hook,
+    dry_run_guard_hook,
+    mcp_input_validation_hook,
+    set_config,
+    set_dry_run_mode,
+)
 from heimdall.config import AdminConfig
 from heimdall.tools._common import validate_name
 
@@ -11,8 +17,10 @@ from heimdall.tools._common import validate_name
 def _setup_config():
     """Set up config for hooks before each test."""
     set_config(AdminConfig())
+    set_dry_run_mode(False)
     yield
     set_config(None)
+    set_dry_run_mode(False)
 
 
 def _bash_input(command: str) -> dict:
@@ -128,6 +136,48 @@ class TestMcpInputValidationHook:
     async def test_non_admin_tool_ignored(self):
         result = await mcp_input_validation_hook(
             _mcp_input("mcp__other__something", "evil; rm /"), None, {}
+        )
+        assert result == {}
+
+
+class TestDryRunHook:
+    @pytest.mark.asyncio
+    async def test_blocks_write_tool(self):
+        set_dry_run_mode(True)
+        result = await dry_run_guard_hook(
+            {"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {}},
+            None,
+            {},
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.asyncio
+    async def test_blocks_mutating_mcp(self):
+        set_dry_run_mode(True)
+        result = await dry_run_guard_hook(
+            _mcp_input("mcp__admin__install_package", "nginx"),
+            None,
+            {},
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.asyncio
+    async def test_allows_status_mcp(self):
+        set_dry_run_mode(True)
+        result = await dry_run_guard_hook(
+            _mcp_input("mcp__admin__service_status", "nginx"),
+            None,
+            {},
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_noop_when_not_in_dry_run(self):
+        set_dry_run_mode(False)
+        result = await dry_run_guard_hook(
+            {"hook_event_name": "PreToolUse", "tool_name": "Write", "tool_input": {}},
+            None,
+            {},
         )
         assert result == {}
 

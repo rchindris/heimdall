@@ -3,89 +3,56 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_agent_sdk import (
-    AgentDefinition,
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    query,
-)
-
 from .config import AdminConfig
-from .hooks import build_hook_matchers, set_config
-from .models import DriftReport, MachineProfile
-from .modules.discovery import DISCOVERY_MODEL, DISCOVERY_SYSTEM_PROMPT, DISCOVERY_TOOLS
-from .modules.guard import GUARD_MODEL, GUARD_SYSTEM_PROMPT, GUARD_TOOLS
-from .modules.recipes import RECIPE_MODEL, RECIPE_SYSTEM_PROMPT, RECIPE_TOOLS
-from .tools import ALL_ADMIN_TOOL_NAMES, create_admin_tools_server
-
-# SDK built-in tools used by the orchestrator
-ORCHESTRATOR_TOOLS = [
-    "Bash",
-    "Read",
-    "Write",
-    "Edit",
-    "Glob",
-    "Grep",
-    "Task",
-]
+from .hooks import set_config, set_dry_run_mode
+from .llm import LLMRunRequest, create_llm_client
+from .models import DriftReport, MachineProfile, RecipeSpec
+from .recipe_parser import ensure_recipe_supported, load_recipe_spec, summarize_sections
 
 
-def _build_agents() -> dict[str, AgentDefinition]:
-    """Build subagent definitions."""
-    return {
-        "discovery": AgentDefinition(
-            description=(
-                "Machine discovery agent that scans OS, hardware, packages, "
-                "services, network, and users to build a complete machine profile."
-            ),
-            prompt=DISCOVERY_SYSTEM_PROMPT,
-            tools=DISCOVERY_TOOLS,
-            model=DISCOVERY_MODEL,
-        ),
-        "recipe-applier": AgentDefinition(
-            description=(
-                "Recipe applier agent that reads markdown recipes describing "
-                "desired machine configuration and applies them step by step."
-            ),
-            prompt=RECIPE_SYSTEM_PROMPT,
-            tools=RECIPE_TOOLS,
-            model=RECIPE_MODEL,
-        ),
-        "guard": AgentDefinition(
-            description=(
-                "Drift detection agent that compares current machine state "
-                "against recipe requirements and reports deviations."
-            ),
-            prompt=GUARD_SYSTEM_PROMPT,
-            tools=GUARD_TOOLS,
-            model=GUARD_MODEL,
-        ),
-    }
+def _ensure_runtime_dirs(config: AdminConfig) -> None:
+    config.recipes_dir.mkdir(parents=True, exist_ok=True)
+    config.profiles_dir.mkdir(parents=True, exist_ok=True)
 
 
-def build_options(
-    config: AdminConfig,
-    system_prompt: str = "",
-) -> ClaudeAgentOptions:
-    """Build ClaudeAgentOptions with all tools, hooks, and subagents configured."""
-    set_config(config)
+def _load_recipe(recipe_path: str, validate_os: bool = False) -> RecipeSpec:
+    path = Path(recipe_path)
+    spec = load_recipe_spec(path)
+    if validate_os:
+        ensure_recipe_supported(spec)
+    return spec
 
-    admin_server = create_admin_tools_server()
 
-    return ClaudeAgentOptions(
-        system_prompt=system_prompt or None,
-        model=config.model,
-        permission_mode=config.permission_mode,
-        max_budget_usd=config.max_budget_usd,
-        allowed_tools=ORCHESTRATOR_TOOLS + ALL_ADMIN_TOOL_NAMES,
-        mcp_servers={"admin": admin_server},
-        agents=_build_agents(),
-        hooks=build_hook_matchers(),
-        cwd=str(Path.cwd()),
+def _recipe_prompt_context(spec: RecipeSpec) -> str:
+    metadata = spec.metadata
+    name = metadata.name or (spec.source_path.name if spec.source_path else "(unknown)")
+    tags = ", ".join(metadata.tags) if metadata.tags else "none"
+    os_targets = ", ".join(metadata.os_families) if metadata.os_families else "any"
+    summary = summarize_sections(spec)
+    return (
+        f"Recipe: {name}\n"
+        f"Description: {metadata.description or 'n/a'}\n"
+        f"Tags: {tags}\n"
+        f"Supported OS families: {os_targets}\n"
+        f"Sections:\n{summary}\n"
+        f"Source path: {spec.source_path}"
     )
+
+
+def _stamp_drift_report(config: AdminConfig, spec: RecipeSpec) -> None:
+    drift_path = config.profiles_dir / "drift-report.json"
+    if not drift_path.exists():
+        return
+    data = json.loads(drift_path.read_text())
+    report = DriftReport(**data)
+    report.recipe_name = report.recipe_name or spec.metadata.name or (
+        spec.source_path.name if spec.source_path else ""
+    )
+    report.checked_at = datetime.now(timezone.utc)
+    drift_path.write_text(report.model_dump_json(indent=2))
 
 
 def _load_profile(config: AdminConfig) -> MachineProfile | None:
@@ -99,6 +66,10 @@ def _load_profile(config: AdminConfig) -> MachineProfile | None:
 
 async def run_init(config: AdminConfig) -> None:
     """Discover machine state and save profile."""
+    _ensure_runtime_dirs(config)
+    set_config(config)
+    set_dry_run_mode(False)
+    client = create_llm_client(config)
     profile = _load_profile(config)
     context = ""
     if profile:
@@ -111,53 +82,82 @@ async def run_init(config: AdminConfig) -> None:
         f"{context}"
     )
 
-    options = build_options(config, system_prompt=(
-        "You are Heimdall, an autonomous machine administration agent. "
-        "Your task is to discover and inventory this machine's state."
-    ))
-
-    async for message in query(prompt=prompt, options=options):
-        _print_message(message)
+    await client.run(
+        LLMRunRequest(
+            operation="init",
+            prompt=prompt,
+            system_prompt=(
+                "You are Heimdall, an autonomous machine administration agent. "
+                "Your task is to discover and inventory this machine's state."
+            ),
+        )
+    )
 
 
 async def run_apply(config: AdminConfig, recipe_path: str, check: bool = False) -> None:
     """Apply a recipe to the machine."""
+    _ensure_runtime_dirs(config)
+    set_config(config)
+    spec = _load_recipe(recipe_path, validate_os=True)
     profile = _load_profile(config)
     profile_context = f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
 
     mode = "DRY RUN (--check)" if check else "APPLY"
+    recipe_context = _recipe_prompt_context(spec)
+    recipe_identity = spec.metadata.name or Path(recipe_path).name
     prompt = (
-        f"[{mode}] Apply the recipe at '{recipe_path}' to this machine. "
-        "Use the recipe-applier subagent to read and execute the recipe."
+        f"[{mode}] Apply the recipe '{recipe_identity}' located at '{recipe_path}' to this machine.\n"
+        f"{recipe_context}\n\n"
+        "Use the recipe-applier subagent to interpret each section, compare it with the current "
+        "machine profile, plan concrete steps, and execute them in order."
         f"{profile_context}"
     )
     if check:
-        prompt += "\n\nThis is a dry run. Do NOT execute any changes, only report what would be done."
+        prompt += (
+            "\n\nThis is a dry run. Provide a detailed plan of actions for every section, "
+            "but do NOT execute any commands that mutate the system."
+        )
 
-    options = build_options(config, system_prompt=(
-        "You are Heimdall, an autonomous machine administration agent. "
-        "Your task is to apply configuration recipes to this machine."
-    ))
-
-    async for message in query(prompt=prompt, options=options):
-        _print_message(message)
+    set_dry_run_mode(check)
+    client = create_llm_client(config)
+    try:
+        await client.run(
+            LLMRunRequest(
+                operation="apply",
+                prompt=prompt,
+                system_prompt=(
+                    "You are Heimdall, an autonomous machine administration agent. "
+                    "Your task is to apply configuration recipes to this machine."
+                ),
+                metadata={"recipe": recipe_identity, "check": check},
+            )
+        )
+    finally:
+        set_dry_run_mode(False)
 
 
 async def run_scan(config: AdminConfig) -> None:
     """Quick profile update."""
+    _ensure_runtime_dirs(config)
+    set_config(config)
+    set_dry_run_mode(False)
+    client = create_llm_client(config)
     prompt = (
         "Perform a quick scan to update the machine profile at "
         f"{config.profiles_dir}/current.json. "
         "Use the discovery subagent for a focused update."
     )
 
-    options = build_options(config, system_prompt=(
-        "You are Heimdall, an autonomous machine administration agent. "
-        "Perform a quick machine state update."
-    ))
-
-    async for message in query(prompt=prompt, options=options):
-        _print_message(message)
+    await client.run(
+        LLMRunRequest(
+            operation="scan",
+            prompt=prompt,
+            system_prompt=(
+                "You are Heimdall, an autonomous machine administration agent. "
+                "Perform a quick machine state update."
+            ),
+        )
+    )
 
 
 async def run_guard(
@@ -165,27 +165,42 @@ async def run_guard(
     recipe_path: str,
 ) -> None:
     """Check for drift from a recipe."""
+    _ensure_runtime_dirs(config)
+    set_config(config)
+    set_dry_run_mode(False)
+    spec = _load_recipe(recipe_path)
     profile = _load_profile(config)
     profile_context = f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
+    recipe_context = _recipe_prompt_context(spec)
+    recipe_identity = spec.metadata.name or Path(recipe_path).name
 
     prompt = (
-        f"Check for drift from the recipe at '{recipe_path}'. "
-        "Use the guard subagent to compare current state against recipe requirements. "
-        f"Write the drift report to {config.profiles_dir}/drift-report.json."
+        f"Check for drift from the recipe '{recipe_identity}' located at '{recipe_path}'.\n"
+        f"{recipe_context}\n\n"
+        "Use the guard subagent to compare current state against every requirement in the recipe. "
+        f"Write the drift report to {config.profiles_dir}/drift-report.json with an accurate summary."
         f"{profile_context}"
     )
 
-    options = build_options(config, system_prompt=(
-        "You are Heimdall, an autonomous machine administration agent. "
-        "Your task is to detect configuration drift."
-    ))
+    client = create_llm_client(config)
+    await client.run(
+        LLMRunRequest(
+            operation="guard",
+            prompt=prompt,
+            system_prompt=(
+                "You are Heimdall, an autonomous machine administration agent. "
+                "Your task is to detect configuration drift."
+            ),
+            metadata={"recipe": recipe_identity},
+        )
+    )
 
-    async for message in query(prompt=prompt, options=options):
-        _print_message(message)
+    _stamp_drift_report(config, spec)
 
 
 def run_status(config: AdminConfig) -> None:
     """Show current profile and drift status."""
+    _ensure_runtime_dirs(config)
     profile = _load_profile(config)
     if not profile:
         print("No machine profile found. Run 'heimdall init' first.")
@@ -200,15 +215,3 @@ def run_status(config: AdminConfig) -> None:
         print("\n" + report.to_markdown())
     else:
         print("\nNo drift report found. Run 'heimdall guard' to check for drift.")
-
-
-def _print_message(message: object) -> None:
-    """Print SDK messages in a human-readable format."""
-    if isinstance(message, AssistantMessage):
-        for block in message.content:
-            if hasattr(block, "text"):
-                print(block.text)
-            elif hasattr(block, "name"):
-                print(f"  [tool] {block.name}")
-    elif isinstance(message, ResultMessage):
-        print(f"\n--- {message.subtype} ---")

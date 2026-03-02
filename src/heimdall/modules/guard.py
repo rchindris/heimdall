@@ -31,12 +31,14 @@ Your workflow:
   ]
 }
 
-Do NOT fix any drift — only report it. Write the report to profiles/drift-report.json.
+Do NOT fix any drift — only report it. Write the report to profiles/drift-report.json, ensuring the
+JSON includes a "checked_at" ISO timestamp and the recipe name when available.
 """
 
 GUARD_TOOLS = [
     "Bash",
     "Read",
+    "Write",
     "Glob",
     "Grep",
     "mcp__admin__list_packages",

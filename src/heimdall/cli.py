@@ -44,7 +44,10 @@ def apply(ctx: click.Context, recipe: Path, check: bool) -> None:
     from .agent import run_apply
 
     config: AdminConfig = ctx.obj["config"]
-    asyncio.run(run_apply(config, str(recipe), check=check))
+    try:
+        asyncio.run(run_apply(config, str(recipe), check=check))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @main.command()

@@ -23,11 +23,14 @@ from .config import AdminConfig
 # Shell metacharacters that indicate command chaining, pipes, or subshells.
 # Commands containing these are denied even if the first token is on the allowlist.
 _SHELL_METACHAR_RE = re.compile(
-    r"[;|&`]"         # semicolon, pipe, ampersand, backtick
+    r"[;|&`\n]"       # semicolon, pipe, ampersand, backtick, newline
     r"|\$\("          # $( command substitution
     r"|>\s*>"         # >> append redirect
     r"|>\s*[^&]"      # > redirect (but not >&)
     r"|<\("           # <( process substitution
+    r"|\|\|"          # || or chain
+    r"|&&"            # && and chain
+    r"|[{}]"          # brace expansion
 )
 
 # Dangerous environment variables that must not be set via env prefix
@@ -35,6 +38,13 @@ _DANGEROUS_ENV_VARS = frozenset({
     "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH", "PYTHONPATH", "PERL5LIB", "RUBYLIB",
     "NODE_PATH", "CLASSPATH", "PATH",
+})
+
+_DRY_RUN_DENY_TOOLS = frozenset({"Bash", "Write", "Edit"})
+_DRY_RUN_ALLOWED_ADMIN_TOOLS = frozenset({
+    "mcp__admin__list_packages",
+    "mcp__admin__query_package",
+    "mcp__admin__service_status",
 })
 
 
@@ -196,6 +206,7 @@ def build_hook_matchers() -> dict[str, list[HookMatcher]]:
     """Build the hooks dict for ClaudeAgentOptions."""
     return {
         "PreToolUse": [
+            HookMatcher(hooks=[dry_run_guard_hook]),
             HookMatcher(matcher="Bash", hooks=[bash_allowlist_hook]),
             HookMatcher(matcher="^mcp__admin__", hooks=[mcp_input_validation_hook]),
         ],
@@ -232,3 +243,40 @@ def _summarize_input(tool_input: dict[str, Any], max_len: int = 2000) -> str:
 
 def _default_audit_path() -> Path:
     return Path.home() / ".local" / "share" / "heimdall" / "audit.log"
+
+
+_dry_run_mode: bool = False
+
+
+async def dry_run_guard_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """PreToolUse hook: block mutating tools while in dry-run mode."""
+
+    if input_data.get("hook_event_name") != "PreToolUse" or not _dry_run_mode:
+        return {}
+
+    tool_name = input_data.get("tool_name", "")
+
+    if tool_name in _DRY_RUN_DENY_TOOLS:
+        return _deny(
+            input_data,
+            "Dry-run mode blocks tool usage. Provide a plan instead of executing changes.",
+        )
+
+    if tool_name.startswith("mcp__admin__") and tool_name not in _DRY_RUN_ALLOWED_ADMIN_TOOLS:
+        return _deny(
+            input_data,
+            "Dry-run mode blocks administrative actions that mutate the system.",
+        )
+
+    return {}
+
+
+def set_dry_run_mode(enabled: bool) -> None:
+    """Enable or disable dry-run enforcement for tool usage."""
+
+    global _dry_run_mode
+    _dry_run_mode = enabled
