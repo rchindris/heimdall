@@ -29,14 +29,20 @@ def validate_name(name: str, kind: str = "package") -> str:
     return name
 
 
-async def run_cmd(cmd: str) -> str:
+async def run_cmd(cmd: str, timeout: int = 60) -> str:
     """Run a shell command and return its output."""
     proc = await asyncio.create_subprocess_shell(
         cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return f"Error: command timed out after {timeout} seconds"
+
     output = stdout.decode() + stderr.decode()
     if proc.returncode != 0:
         return f"Error (exit {proc.returncode}):\n{output}"

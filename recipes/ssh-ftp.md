@@ -33,7 +33,22 @@ Ensure the system is fully updated via the package manager before making any cha
 - Ensure `/srv/ftp` exists and is owned by `ftp:ftp` with mode `0755`.
 - Enable and start the `vsftpd` service.
 
+## Firewall
+
+- Ensure `ufw` (Debian/Ubuntu) or `firewalld` (RHEL/Fedora) is installed.
+- For `ufw`:
+  - Set default incoming policy to DENY.
+  - Allow SSH (22/tcp).
+  - Allow FTP (21/tcp).
+  - Enable the firewall.
+- For `firewalld`:
+  - Set default zone to drop.
+  - Add permanent rules for SSH (22/tcp) and FTP (21/tcp).
+  - Reload firewall.
+- Confirm with `ufw status` or `firewall-cmd --list-all` that only ports 21 and 22 are allowed.
+
 ## Verification
 
 - Confirm `sshd` is listening on port 22 and `vsftpd` on port 21.
 - Ensure both services are enabled at boot.
+- Verify firewall allows only SSH (22) and FTP (21).

@@ -46,10 +46,16 @@ def _stamp_drift_report(config: AdminConfig, spec: RecipeSpec) -> None:
     drift_path = config.profiles_dir / "drift-report.json"
     if not drift_path.exists():
         return
-    data = json.loads(drift_path.read_text())
-    report = DriftReport(**data)
-    report.recipe_name = report.recipe_name or spec.metadata.name or (
-        spec.source_path.name if spec.source_path else ""
+    try:
+        data = json.loads(drift_path.read_text())
+        report = DriftReport(**data)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Warning: Could not parse drift report: {e}")
+        return
+    report.recipe_name = (
+        report.recipe_name
+        or spec.metadata.name
+        or (spec.source_path.name if spec.source_path else "")
     )
     report.checked_at = datetime.now(timezone.utc)
     drift_path.write_text(report.model_dump_json(indent=2))
@@ -59,8 +65,12 @@ def _load_profile(config: AdminConfig) -> MachineProfile | None:
     """Load the current machine profile if it exists."""
     profile_path = config.profiles_dir / "current.json"
     if profile_path.exists():
-        data = json.loads(profile_path.read_text())
-        return MachineProfile(**data)
+        try:
+            data = json.loads(profile_path.read_text())
+            return MachineProfile(**data)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Warning: Could not parse profile: {e}")
+            return None
     return None
 
 
@@ -100,7 +110,9 @@ async def run_apply(config: AdminConfig, recipe_path: str, check: bool = False) 
     set_config(config)
     spec = _load_recipe(recipe_path, validate_os=True)
     profile = _load_profile(config)
-    profile_context = f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
+    profile_context = (
+        f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
+    )
 
     mode = "DRY RUN (--check)" if check else "APPLY"
     recipe_context = _recipe_prompt_context(spec)
@@ -170,7 +182,9 @@ async def run_guard(
     set_dry_run_mode(False)
     spec = _load_recipe(recipe_path)
     profile = _load_profile(config)
-    profile_context = f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
+    profile_context = (
+        f"\n\nCurrent machine profile:\n{profile.to_markdown()}" if profile else ""
+    )
     recipe_context = _recipe_prompt_context(spec)
     recipe_identity = spec.metadata.name or Path(recipe_path).name
 
@@ -210,8 +224,11 @@ def run_status(config: AdminConfig) -> None:
 
     drift_path = config.profiles_dir / "drift-report.json"
     if drift_path.exists():
-        data = json.loads(drift_path.read_text())
-        report = DriftReport(**data)
-        print("\n" + report.to_markdown())
+        try:
+            data = json.loads(drift_path.read_text())
+            report = DriftReport(**data)
+            print("\n" + report.to_markdown())
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Warning: Could not parse drift report: {e}")
     else:
         print("\nNo drift report found. Run 'heimdall guard' to check for drift.")

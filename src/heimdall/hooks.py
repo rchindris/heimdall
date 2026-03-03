@@ -9,9 +9,12 @@ PostToolUse hook: audit logging for all tool invocations.
 from __future__ import annotations
 
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shlex
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,32 +23,51 @@ from claude_agent_sdk import HookMatcher
 
 from .config import AdminConfig
 
+# Audit log settings
+MAX_AUDIT_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_AUDIT_LOG_COUNT = 5
+
+# Context variables for async-safe state management
+_config_var: ContextVar[AdminConfig | None] = ContextVar("config_ref", default=None)
+_dry_run_var: ContextVar[bool] = ContextVar("dry_run_mode", default=False)
+
 # Shell metacharacters that indicate command chaining, pipes, or subshells.
 # Commands containing these are denied even if the first token is on the allowlist.
 _SHELL_METACHAR_RE = re.compile(
-    r"[;|&`\n]"       # semicolon, pipe, ampersand, backtick, newline
-    r"|\$\("          # $( command substitution
-    r"|>\s*>"         # >> append redirect
-    r"|>\s*[^&]"      # > redirect (but not >&)
-    r"|<\("           # <( process substitution
-    r"|\|\|"          # || or chain
-    r"|&&"            # && and chain
-    r"|[{}]"          # brace expansion
+    r"[;|&`\n]"  # semicolon, pipe, ampersand, backtick, newline
+    r"|\$\("  # $( command substitution
+    r"|>\s*>"  # >> append redirect
+    r"|>\s*[^&]"  # > redirect (but not >&)
+    r"|<\("  # <( process substitution
+    r"|\|\|"  # || or chain
+    r"|&&"  # && and chain
+    r"|[{}]"  # brace expansion
 )
 
 # Dangerous environment variables that must not be set via env prefix
-_DANGEROUS_ENV_VARS = frozenset({
-    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH", "PYTHONPATH", "PERL5LIB", "RUBYLIB",
-    "NODE_PATH", "CLASSPATH", "PATH",
-})
+_DANGEROUS_ENV_VARS = frozenset(
+    {
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "PYTHONPATH",
+        "PERL5LIB",
+        "RUBYLIB",
+        "NODE_PATH",
+        "CLASSPATH",
+        "PATH",
+    }
+)
 
 _DRY_RUN_DENY_TOOLS = frozenset({"Bash", "Write", "Edit"})
-_DRY_RUN_ALLOWED_ADMIN_TOOLS = frozenset({
-    "mcp__admin__list_packages",
-    "mcp__admin__query_package",
-    "mcp__admin__service_status",
-})
+_DRY_RUN_ALLOWED_ADMIN_TOOLS = frozenset(
+    {
+        "mcp__admin__list_packages",
+        "mcp__admin__query_package",
+        "mcp__admin__service_status",
+    }
+)
 
 
 async def bash_allowlist_hook(
@@ -68,7 +90,7 @@ async def bash_allowlist_hook(
         return {}
 
     command = input_data.get("tool_input", {}).get("command", "")
-    allowed = _config_ref.allowed_command_prefixes if _config_ref else []
+    allowed = _config_var.get() if _config_var.get() is not None else []
 
     # Layer 1: Reject shell metacharacters
     if _SHELL_METACHAR_RE.search(command):
@@ -111,6 +133,8 @@ async def bash_allowlist_hook(
         first_cmd = tokens[0]
 
     # Layer 4: Check allowlist
+    config = _config_var.get()
+    allowed = config.allowed_command_prefixes if config else []
     if first_cmd not in allowed:
         return _deny(
             input_data,
@@ -172,8 +196,13 @@ async def audit_log_hook(
     if input_data.get("hook_event_name") != "PostToolUse":
         return {}
 
-    log_path = _config_ref.audit_log_path if _config_ref else _default_audit_path()
+    config = _config_var.get()
+    log_path = config.audit_log_path if config else _default_audit_path()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Rotate log if it exceeds max size
+    if log_path.exists() and log_path.stat().st_size > MAX_AUDIT_LOG_SIZE:
+        _rotate_audit_log(log_path)
 
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -182,24 +211,39 @@ async def audit_log_hook(
         "input": _summarize_input(input_data.get("tool_input", {})),
     }
 
-    fd = os.open(str(log_path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.write(fd, (json.dumps(entry) + "\n").encode())
-    finally:
-        os.close(fd)
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        # Log to stderr as fallback if we can't write to the audit log
+        import sys
+
+        print(f"Warning: Could not write to audit log: {e}", file=sys.stderr)
 
     return {}
 
 
-# --- Module-level config reference (set by agent.py before use) ---
+def _rotate_audit_log(log_path: Path) -> None:
+    """Rotate audit log files."""
+    # Remove oldest backup if we exceed max count
+    oldest = log_path.with_suffix(f"{log_path.suffix}.{MAX_AUDIT_LOG_COUNT}")
+    if oldest.exists():
+        oldest.unlink()
 
-_config_ref: AdminConfig | None = None
+    # Shift existing backups
+    for i in range(MAX_AUDIT_LOG_COUNT - 1, 0, -1):
+        src = log_path.with_suffix(f"{log_path.suffix}.{i}")
+        dst = log_path.with_suffix(f"{log_path.suffix}.{i + 1}")
+        if src.exists():
+            src.rename(dst)
+
+    # Rename current log to .1
+    log_path.rename(log_path.with_suffix(f"{log_path.suffix}.1"))
 
 
 def set_config(config: AdminConfig) -> None:
     """Set the config reference used by hooks."""
-    global _config_ref
-    _config_ref = config
+    _config_var.set(config)
 
 
 def build_hook_matchers() -> dict[str, list[HookMatcher]]:
@@ -245,9 +289,6 @@ def _default_audit_path() -> Path:
     return Path.home() / ".local" / "share" / "heimdall" / "audit.log"
 
 
-_dry_run_mode: bool = False
-
-
 async def dry_run_guard_hook(
     input_data: dict[str, Any],
     tool_use_id: str | None,
@@ -255,7 +296,7 @@ async def dry_run_guard_hook(
 ) -> dict[str, Any]:
     """PreToolUse hook: block mutating tools while in dry-run mode."""
 
-    if input_data.get("hook_event_name") != "PreToolUse" or not _dry_run_mode:
+    if input_data.get("hook_event_name") != "PreToolUse" or not _dry_run_var.get():
         return {}
 
     tool_name = input_data.get("tool_name", "")
@@ -266,7 +307,10 @@ async def dry_run_guard_hook(
             "Dry-run mode blocks tool usage. Provide a plan instead of executing changes.",
         )
 
-    if tool_name.startswith("mcp__admin__") and tool_name not in _DRY_RUN_ALLOWED_ADMIN_TOOLS:
+    if (
+        tool_name.startswith("mcp__admin__")
+        and tool_name not in _DRY_RUN_ALLOWED_ADMIN_TOOLS
+    ):
         return _deny(
             input_data,
             "Dry-run mode blocks administrative actions that mutate the system.",
@@ -277,6 +321,4 @@ async def dry_run_guard_hook(
 
 def set_dry_run_mode(enabled: bool) -> None:
     """Enable or disable dry-run enforcement for tool usage."""
-
-    global _dry_run_mode
-    _dry_run_mode = enabled
+    _dry_run_var.set(enabled)

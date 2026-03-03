@@ -24,6 +24,44 @@ import heimdall.tools.service_manager as svc_mgr
 
 from .base import LLMClient, LLMRunRequest
 
+# Allowed base directories for file operations (can be customized)
+ALLOWED_BASE_DIRS = [
+    Path("/home"),
+    Path("/var"),
+    Path("/opt"),
+    Path("/srv"),
+    Path("/tmp"),
+]
+
+
+def _validate_path(path: str | Path) -> tuple[Path | None, str]:
+    """Validate path to prevent path traversal attacks.
+
+    Returns (resolved_path, error_message). If valid, error_message is empty.
+    """
+    file_path = Path(path).resolve()
+
+    # Check if path is within any allowed directory
+    for base_dir in ALLOWED_BASE_DIRS:
+        try:
+            file_path.relative_to(base_dir)
+            return file_path, ""
+        except ValueError:
+            continue
+
+    # Also allow paths in current working directory
+    try:
+        cwd = Path.cwd()
+        file_path.relative_to(cwd)
+        return file_path, ""
+    except ValueError:
+        pass
+
+    return (
+        None,
+        f"Error: path '{path}' is outside allowed directories. Only paths in {', '.join(str(d) for d in ALLOWED_BASE_DIRS)} and current directory are allowed.",
+    )
+
 
 @dataclass
 class ToolSpec:
@@ -50,7 +88,11 @@ class ToolExecutor:
         }
 
     async def run(self, name: str, args: dict[str, Any]) -> str:
-        pre_ctx = {"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": args}
+        pre_ctx = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": name,
+            "tool_input": args,
+        }
         hook = await dry_run_guard_hook(pre_ctx, None, {})
         if _is_denied(hook):
             return _denial_reason(hook)
@@ -75,7 +117,11 @@ class ToolExecutor:
             return "Error: command cannot be empty"
 
         hook = await bash_allowlist_hook(
-            {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}},
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
             None,
             {},
         )
@@ -87,10 +133,22 @@ class ToolExecutor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=args.get("timeout", 60)
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return f"Error: command timed out after {args.get('timeout', 60)} seconds"
+
         output = stdout.decode() + stderr.decode()
         await audit_log_hook(
-            {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": command}},
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            },
             None,
             {},
         )
@@ -100,9 +158,16 @@ class ToolExecutor:
         path = args.get("path")
         if not path:
             return "Error: path is required"
-        file_path = Path(path)
+
+        file_path, error = _validate_path(path)
+        if error:
+            return error
+        assert file_path is not None
         if not file_path.exists():
             return f"Error: {path} not found"
+        if not file_path.is_file():
+            return f"Error: {path} is not a file"
+
         data = file_path.read_text(errors="ignore")
         limit = int(args.get("limit", 4000))
         return data[:limit]
@@ -112,11 +177,20 @@ class ToolExecutor:
         content = args.get("content", "")
         if not path:
             return "Error: path is required"
-        file_path = Path(path)
+
+        file_path, error = _validate_path(path)
+        if error:
+            return error
+        assert file_path is not None
+
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
         await audit_log_hook(
-            {"hook_event_name": "PostToolUse", "tool_name": "Write", "tool_input": {"path": path}},
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Write",
+                "tool_input": {"path": path},
+            },
             None,
             {},
         )
@@ -126,19 +200,52 @@ class ToolExecutor:
         pattern = args.get("pattern", "")
         if not pattern:
             return "Error: pattern is required"
-        matches = sorted(glob.glob(pattern, recursive=True))
-        return "\n".join(matches) or "(no matches)"
+
+        # Validate the pattern doesn't escape allowed directories
+        # Convert glob pattern to check if base is in allowed dirs
+        if ".." in pattern:
+            return "Error: '..' not allowed in glob pattern"
+
+        # Resolve pattern relative to allowed directories
+        matches = []
+        for base_dir in ALLOWED_BASE_DIRS:
+            full_pattern = str(base_dir / pattern)
+            matches.extend(glob.glob(full_pattern, recursive=True))
+
+        # Also check cwd
+        cwd_matches = glob.glob(pattern, recursive=True)
+        for m in cwd_matches:
+            if m not in matches:
+                matches.append(m)
+
+        # Filter to only files in allowed directories
+        validated_matches = []
+        for m in matches:
+            file_path, error = _validate_path(m)
+            if file_path:
+                validated_matches.append(m)
+
+        return "\n".join(sorted(validated_matches)) or "(no matches)"
 
     def _run_grep(self, args: dict[str, Any]) -> str:
         pattern = args.get("pattern", "")
         path = args.get("path", "")
         if not pattern or not path:
             return "Error: pattern and path are required"
-        file_path = Path(path)
+
+        file_path, error = _validate_path(path)
+        if error:
+            return error
+        assert file_path is not None
         if not file_path.exists():
             return f"Error: {path} not found"
+        if not file_path.is_file():
+            return f"Error: {path} is not a file"
+
         matches = []
-        for line_no, line in enumerate(file_path.read_text(errors="ignore").splitlines(), start=1):
+        for line_no, line in enumerate(
+            file_path.read_text(errors="ignore").splitlines(), start=1
+        ):
             if pattern in line:
                 matches.append(f"{line_no}: {line}")
         return "\n".join(matches) or "(no matches)"
@@ -151,7 +258,7 @@ class ToolExecutor:
         )
         if _is_denied(hook):
             return _denial_reason(hook)
-        
+
         # Map tool name to handler function
         handlers = {
             "mcp__admin__install_package": pkg_mgr.install_package,
@@ -164,18 +271,22 @@ class ToolExecutor:
             "mcp__admin__stop_service": svc_mgr.stop_service,
             "mcp__admin__service_status": svc_mgr.service_status,
         }
-        
+
         handler = handlers.get(name)
         if not handler:
             return f"Unknown MCP tool: {name}"
-        
+
         # The @tool decorator wraps the function, call the underlying __call__
         if hasattr(handler, "__call__"):
             result = await handler(args)
         else:
             return f"Tool {name} is not callable"
-            
-        text_blocks = [block.get("text", "") for block in result.get("content", []) if block.get("type") == "text"]
+
+        text_blocks = [
+            block.get("text", "")
+            for block in result.get("content", [])
+            if block.get("type") == "text"
+        ]
         await audit_log_hook(
             {"hook_event_name": "PostToolUse", "tool_name": name, "tool_input": args},
             None,
@@ -205,7 +316,8 @@ class OpenRouterLLMClient(LLMClient):
 
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": self.config.openrouter_referer or "https://github.com/anthropics/heimdall",
+            "HTTP-Referer": self.config.openrouter_referer
+            or "https://github.com/anthropics/heimdall",
             "X-Title": self.config.openrouter_title or "Heimdall",
         }
 
@@ -228,7 +340,9 @@ class OpenRouterLLMClient(LLMClient):
                     "temperature": self.config.openrouter_temperature,
                 }
                 try:
-                    response = await client.post("/chat/completions", json=payload, headers=headers)
+                    response = await client.post(
+                        "/chat/completions", json=payload, headers=headers
+                    )
                     response.raise_for_status()
                     data = response.json()
                 except httpx.HTTPStatusError as e:
@@ -248,8 +362,29 @@ class OpenRouterLLMClient(LLMClient):
                         raise RuntimeError(
                             f"OpenRouter API error ({e.response.status_code}): {e.response.text[:500]}"
                         ) from e
+                except httpx.HTTPError as e:
+                    raise RuntimeError(
+                        f"OpenRouter request failed: {str(e)[:500]}"
+                    ) from e
+
+                try:
+                    data = response.json()
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(
+                        f"Invalid JSON response from OpenRouter: {str(e)[:500]}"
+                    ) from e
+
+                if not data.get("choices"):
+                    if data.get("error"):
+                        raise RuntimeError(f"OpenRouter error: {data['error']}")
+                    raise RuntimeError("OpenRouter response missing 'choices' field")
+
                 choice = data["choices"][0]
-                message = choice["message"]
+                message = choice.get("message")
+                if not message:
+                    raise RuntimeError(
+                        "OpenRouter response missing 'message' in choice"
+                    )
 
                 tool_calls = message.get("tool_calls") or []
                 if tool_calls:
@@ -276,7 +411,10 @@ class OpenRouterLLMClient(LLMClient):
                 content = message.get("content")
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "output_text":
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "output_text"
+                        ):
                             print(block.get("text", ""))
                         elif isinstance(block, dict):
                             print(block.get("text", ""))
@@ -296,11 +434,31 @@ class OpenRouterLLMClient(LLMClient):
 
     def _tool_definitions(self) -> list[dict[str, Any]]:
         return [
-            _tool("Bash", "Execute an allowlisted shell command.", {"command": _string_schema()}),
-            _tool("Read", "Read a text file (first 4000 chars).", {"path": _string_schema(), "limit": {"type": "integer"}}),
-            _tool("Write", "Overwrite a text file with provided content.", {"path": _string_schema(), "content": _string_schema()}),
-            _tool("Glob", "Find files matching a glob pattern.", {"pattern": _string_schema()}),
-            _tool("Grep", "Search for a literal pattern within a file.", {"path": _string_schema(), "pattern": _string_schema()}),
+            _tool(
+                "Bash",
+                "Execute an allowlisted shell command.",
+                {"command": _string_schema()},
+            ),
+            _tool(
+                "Read",
+                "Read a text file (first 4000 chars).",
+                {"path": _string_schema(), "limit": {"type": "integer"}},
+            ),
+            _tool(
+                "Write",
+                "Overwrite a text file with provided content.",
+                {"path": _string_schema(), "content": _string_schema()},
+            ),
+            _tool(
+                "Glob",
+                "Find files matching a glob pattern.",
+                {"pattern": _string_schema()},
+            ),
+            _tool(
+                "Grep",
+                "Search for a literal pattern within a file.",
+                {"path": _string_schema(), "pattern": _string_schema()},
+            ),
             *_mcp_tool_specs(),
         ]
 
@@ -322,10 +480,18 @@ def _tool(name: str, description: str, properties: dict[str, Any]) -> dict[str, 
 
 def _mcp_tool_specs() -> list[dict[str, Any]]:
     tools: list[tuple[str, str, bool]] = [
-        ("mcp__admin__install_package", "Install a package using the native package manager.", True),
+        (
+            "mcp__admin__install_package",
+            "Install a package using the native package manager.",
+            True,
+        ),
         ("mcp__admin__remove_package", "Remove a package.", True),
         ("mcp__admin__list_packages", "List installed packages.", False),
-        ("mcp__admin__query_package", "Show detailed information about a package.", True),
+        (
+            "mcp__admin__query_package",
+            "Show detailed information about a package.",
+            True,
+        ),
         ("mcp__admin__enable_service", "Enable a system service.", True),
         ("mcp__admin__disable_service", "Disable a system service.", True),
         ("mcp__admin__start_service", "Start a system service.", True),
@@ -368,7 +534,9 @@ def _is_denied(result: dict[str, Any] | None) -> bool:
 def _denial_reason(result: dict[str, Any] | None) -> str:
     if not result:
         return "Denied"
-    return result.get("hookSpecificOutput", {}).get("permissionDecisionReason", "Denied")
+    return result.get("hookSpecificOutput", {}).get(
+        "permissionDecisionReason", "Denied"
+    )
 
 
 def _resolve_api_key(env_name: str | None) -> str | None:
